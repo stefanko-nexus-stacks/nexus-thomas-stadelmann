@@ -401,7 +401,7 @@
         };
 
         function createServiceCard(name, service, isActive) {
-            const url = `https://${service.subdomain}.${DOMAIN}`;
+            const url = `https://${service.subdomain}-thomas-stadelmann.nona.company`;
             const description = descriptions[name] || 'No description available';
             const card = document.createElement('div');
             card.className = `service-card ${isActive ? '' : 'disabled'}`;
