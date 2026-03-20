@@ -1,0 +1,417 @@
+name: Destroy All Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "DESTROY" (uppercase) to confirm FULL destruction'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infrastructure
+  cancel-in-progress: false
+
+jobs:
+  destroy:
+    name: Destroy All Nexus-Stack Resources
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirm == 'DESTROY'
+    env:
+      TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      TF_VAR_cloudflare_zone_id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+      TF_VAR_hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
+      TF_VAR_domain: ${{ secrets.DOMAIN }}
+      TF_VAR_access_emails: ${{ secrets.ACCESS_EMAILS }}
+      TF_VAR_infisical_token: ${{ secrets.INFISICAL_TOKEN }}
+      TF_VAR_github_owner: ${{ github.repository_owner }}
+      TF_VAR_github_repo: ${{ github.event.repository.name }}
+      TF_VAR_hetzner_object_storage_access_key: ${{ secrets.HETZNER_OBJECT_STORAGE_ACCESS_KEY }}
+      TF_VAR_hetzner_object_storage_secret_key: ${{ secrets.HETZNER_OBJECT_STORAGE_SECRET_KEY }}
+
+    
+    steps:
+      - name: Validate confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "DESTROY" ]; then
+            echo "❌ Destruction cancelled. You must type 'DESTROY' (uppercase) to confirm."
+            exit 1
+          fi
+          echo "⚠️  DESTRUCTION CONFIRMED - This will delete ALL infrastructure and state!"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: 1.10.0
+
+      - name: Generate SSH key for OpenTofu
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -C "github-actions@nexus-stack"
+          chmod 600 ~/.ssh/id_ed25519
+          chmod 644 ~/.ssh/id_ed25519.pub
+
+      - name: Create R2 credentials from secrets
+        run: |
+          mkdir -p tofu tofu/control-plane tofu/stack
+          
+          # Generate dynamic bucket name from domain
+          BUCKET_NAME=$(echo "${{ secrets.DOMAIN }}" | tr '.' '-')-terraform-state
+          echo "📦 Using bucket: $BUCKET_NAME"
+          
+          cat > tofu/.r2-credentials << EOF
+          R2_ACCESS_KEY_ID="${{ secrets.R2_ACCESS_KEY_ID }}"
+          R2_SECRET_ACCESS_KEY="${{ secrets.R2_SECRET_ACCESS_KEY }}"
+          EOF
+          
+          cat > tofu/backend.hcl << EOF
+          endpoints = {
+            s3 = "https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          }
+          bucket = "${BUCKET_NAME}"
+          EOF
+
+      - name: Generate config.tfvars
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          # Stack config (emails from secrets)
+          cat > tofu/stack/config.tfvars << EOF
+          server_type     = "cax31"
+          server_location = "fsn1"
+          server_image    = "ubuntu-24.04"
+          ssh_public_key_path  = "~/.ssh/id_ed25519.pub"
+          ssh_private_key_path = "~/.ssh/id_ed25519"
+          domain         = "${{ secrets.DOMAIN }}"
+          admin_email    = "${{ secrets.TF_VAR_admin_email }}"
+          user_email     = "${{ secrets.TF_VAR_user_email }}"
+          admin_username = "admin"
+          github_owner   = "${{ github.repository_owner }}"
+          github_repo    = "${{ github.event.repository.name }}"
+          EOF
+          
+          # Read services from D1 (single source of truth)
+          echo "📋 Reading services from D1..."
+          D1_DATABASE_NAME="nexus-${DOMAIN//./-}-db"
+          ENABLED_SERVICES=$(npx wrangler@latest d1 execute "$D1_DATABASE_NAME" --remote --json \
+            --command "SELECT name FROM services WHERE enabled = 1" 2>/dev/null \
+            | jq -r '.[0].results | map(.name) | join(",")' 2>/dev/null || echo "")
+          
+          if [ -n "$ENABLED_SERVICES" ]; then
+            echo "📋 Enabled services from D1: $ENABLED_SERVICES"
+          else
+            echo "📋 No services in D1 yet - core services will be enabled by default"
+          fi
+          
+          # Generate services config from services.yaml
+          # Use shared script to avoid code duplication
+          chmod +x .github/scripts/generate-services-tfvars.py
+          ENABLED_SERVICES="$ENABLED_SERVICES" python3 .github/scripts/generate-services-tfvars.py
+          
+          # Control Plane config
+          cat > tofu/control-plane/config.tfvars << EOF
+          server_type     = "cax31"
+          server_location = "fsn1"
+          domain          = "${{ secrets.DOMAIN }}"
+          admin_email     = "${{ secrets.TF_VAR_admin_email }}"
+          user_email      = "${{ secrets.TF_VAR_user_email }}"
+          github_owner    = "${{ github.repository_owner }}"
+          github_repo     = "${{ github.event.repository.name }}"
+          EOF
+
+      - name: Initialize OpenTofu for both states
+        run: |
+          source tofu/.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+
+          # Initialize Nexus Stack state
+          cd tofu/stack
+          if ! tofu init -backend-config=../backend.hcl; then
+            echo "❌ ERROR: Failed to initialize Nexus Stack backend"
+            echo "   Check R2 credentials and bucket access"
+            exit 1
+          fi
+          echo "✅ Nexus Stack backend initialized"
+
+          # Initialize Control Plane state
+          cd ../control-plane
+          if ! tofu init -backend-config=../backend.hcl; then
+            echo "❌ ERROR: Failed to initialize Control Plane backend"
+            echo "   Check R2 credentials and bucket access"
+            exit 1
+          fi
+          echo "✅ Control Plane backend initialized"
+
+          # Get persistent volume ID from control-plane and add to stack config
+          PERSISTENT_VOLUME_ID=$(tofu output -raw persistent_volume_id 2>/dev/null || echo "0")
+          # Validate ID is numeric (tofu wrapper may write ::error:: to stdout)
+          if [[ ! "$PERSISTENT_VOLUME_ID" =~ ^[0-9]+$ ]]; then
+            PERSISTENT_VOLUME_ID="0"
+          fi
+          cd ../..
+          echo "" >> tofu/stack/config.tfvars
+          printf 'persistent_volume_id = %s\n' "$PERSISTENT_VOLUME_ID" >> tofu/stack/config.tfvars
+          if [ "$PERSISTENT_VOLUME_ID" != "0" ]; then
+            echo "💾 Persistent volume will be destroyed (ID: $PERSISTENT_VOLUME_ID)"
+          fi
+
+      - name: Destroy Nexus Stack infrastructure
+        run: |
+          cd tofu/stack
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+
+          echo "🗑️  Destroying Nexus Stack (Server, Tunnel, Services)..."
+          if ! tofu destroy -var-file=config.tfvars -auto-approve; then
+            echo "❌ ERROR: Failed to destroy Nexus Stack infrastructure"
+            echo "   Resources may still be running in Hetzner Cloud - check logs above"
+            exit 1
+          fi
+          echo "✅ Nexus Stack destroyed successfully"
+
+      - name: Destroy Control Plane infrastructure
+        run: |
+          cd tofu/control-plane
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+
+          echo "🗑️  Destroying Control Plane (Pages, Worker, DNS)..."
+          if ! tofu destroy -var-file=config.tfvars -auto-approve; then
+            echo "❌ ERROR: Failed to destroy Control Plane infrastructure"
+            echo "   Resources may still exist in Cloudflare - check logs above"
+            exit 1
+          fi
+          echo "✅ Control Plane destroyed successfully"
+
+      - name: Cleanup orphaned Hetzner Object Storage buckets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          echo "🗑️  Cleaning up Hetzner Object Storage buckets (fallback)..."
+
+          # Check if Hetzner credentials exist
+          if [ -z "${{ secrets.HETZNER_OBJECT_STORAGE_ACCESS_KEY }}" ]; then
+            echo "  ℹ️  Hetzner Object Storage not configured - skipping"
+            exit 0
+          fi
+
+          # Install AWS CLI if not present
+          if ! command -v aws &> /dev/null; then
+            echo "  Installing AWS CLI..."
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip -q awscliv2.zip
+            sudo ./aws/install
+            rm -rf aws awscliv2.zip
+          fi
+
+          # Configure AWS CLI for Hetzner Object Storage
+          export AWS_ACCESS_KEY_ID="${{ secrets.HETZNER_OBJECT_STORAGE_ACCESS_KEY }}"
+          export AWS_SECRET_ACCESS_KEY="${{ secrets.HETZNER_OBJECT_STORAGE_SECRET_KEY }}"
+          export AWS_DEFAULT_REGION="eu-central-1"
+
+          # Try to get endpoint from control-plane output, fallback to default
+          cd tofu/control-plane
+          HETZNER_S3_SERVER=$(tofu output -raw hetzner_s3_server 2>/dev/null || echo "fsn1.your-objectstorage.com")
+          cd ../..
+
+          ENDPOINT_URL="https://${HETZNER_S3_SERVER}"
+          RESOURCE_PREFIX=$(echo "$DOMAIN" | tr '.' '-')
+
+          BUCKET_CLEANUP_FAILED=false
+
+          # Delete LakeFS bucket (if still exists after Terraform destroy)
+          LAKEFS_BUCKET="nexus-${RESOURCE_PREFIX}-lakefs"
+          echo "  Checking bucket: $LAKEFS_BUCKET"
+          if aws s3api head-bucket --bucket "${LAKEFS_BUCKET}" --endpoint-url="$ENDPOINT_URL" 2>/dev/null; then
+            echo "    Deleting orphaned bucket: $LAKEFS_BUCKET"
+            aws s3 rm "s3://${LAKEFS_BUCKET}" --recursive --endpoint-url="$ENDPOINT_URL" 2>/dev/null || true
+            if ! aws s3 rb "s3://${LAKEFS_BUCKET}" --force --endpoint-url="$ENDPOINT_URL" 2>&1; then
+              echo "    ❌ ERROR: Could not delete bucket $LAKEFS_BUCKET"
+              echo "    Manual cleanup required via Hetzner Console"
+              BUCKET_CLEANUP_FAILED=true
+            else
+              echo "    ✅ Bucket $LAKEFS_BUCKET deleted"
+            fi
+          else
+            echo "    Bucket already deleted by Terraform"
+          fi
+
+          # Delete General bucket (if still exists after Terraform destroy)
+          GENERAL_BUCKET="nexus-${RESOURCE_PREFIX}"
+          echo "  Checking bucket: $GENERAL_BUCKET"
+          if aws s3api head-bucket --bucket "${GENERAL_BUCKET}" --endpoint-url="$ENDPOINT_URL" 2>/dev/null; then
+            echo "    Deleting orphaned bucket: $GENERAL_BUCKET"
+            aws s3 rm "s3://${GENERAL_BUCKET}" --recursive --endpoint-url="$ENDPOINT_URL" 2>/dev/null || true
+            if ! aws s3 rb "s3://${GENERAL_BUCKET}" --force --endpoint-url="$ENDPOINT_URL" 2>&1; then
+              echo "    ❌ ERROR: Could not delete bucket $GENERAL_BUCKET"
+              echo "    Manual cleanup required via Hetzner Console"
+              BUCKET_CLEANUP_FAILED=true
+            else
+              echo "    ✅ Bucket $GENERAL_BUCKET deleted"
+            fi
+          else
+            echo "    Bucket already deleted by Terraform"
+          fi
+
+          if [ "${BUCKET_CLEANUP_FAILED}" = "true" ]; then
+            echo ""
+            echo "  ⚠️  Some Hetzner Object Storage buckets could not be deleted."
+            echo "  Delete them manually via Hetzner Console before re-deploying."
+            echo "  Next initial-setup will fail if stale buckets remain."
+            exit 1
+          else
+            echo "  ✅ Hetzner Object Storage cleanup completed"
+          fi
+
+      - name: Delete R2 secrets from GitHub
+        env:
+          GH_TOKEN: ${{ secrets.GH_SECRETS_TOKEN }}
+        run: |
+          if [ -n "$GH_TOKEN" ]; then
+            echo "🔐 Cleaning up R2 secrets from GitHub..."
+            gh secret delete R2_ACCESS_KEY_ID 2>/dev/null || true
+            gh secret delete R2_SECRET_ACCESS_KEY 2>/dev/null || true
+            echo "✅ R2 secrets deleted"
+          else
+            echo "⚠️  GH_SECRETS_TOKEN not configured - R2 secrets must be deleted manually"
+            echo "   Run: gh secret delete R2_ACCESS_KEY_ID && gh secret delete R2_SECRET_ACCESS_KEY"
+          fi
+
+      - name: Cleanup R2 API tokens from Cloudflare
+        run: |
+          echo "🔐 Cleaning up R2 API token for this deployment..."
+          # Only delete the token for THIS deployment (exact match on domain slug)
+          # Other deployments sharing the same Cloudflare account must not be affected
+          DOMAIN_SLUG=$(printf '%s' "${{ secrets.DOMAIN }}" | tr '.' '-')
+          TOKEN_NAME="nexus-r2-terraform-state-${DOMAIN_SLUG}"
+
+          TOKENS=$(curl -s "https://api.cloudflare.com/client/v4/user/tokens?per_page=100" \
+            -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+            | jq -r --arg name "$TOKEN_NAME" '.result[] | select(.name == $name) | .id')
+
+          if [ -n "$TOKENS" ]; then
+            for token_id in $TOKENS; do
+              echo "  Deleting token: $TOKEN_NAME ($token_id)"
+              if ! curl -sSf -X DELETE "https://api.cloudflare.com/client/v4/user/tokens/$token_id" \
+                -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" > /dev/null; then
+                echo "  ⚠️  Failed to delete token $token_id - check permissions"
+              fi
+            done
+            echo "✅ R2 API token deleted"
+          else
+            echo "  No R2 token found for ${TOKEN_NAME}"
+          fi
+
+      - name: Delete R2 bucket and contents
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          echo "🗑️  Deleting R2 bucket and contents..."
+          
+          # Generate bucket name (same as used in init-r2-state.sh)
+          BUCKET_NAME=$(echo "$DOMAIN" | tr '.' '-')-terraform-state
+          echo "  Bucket: $BUCKET_NAME"
+          
+          # Check if bucket exists
+          BUCKET_CHECK=$(curl -s -w "\n%{http_code}" \
+            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/r2/buckets/${BUCKET_NAME}" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+          
+          HTTP_CODE=$(echo "$BUCKET_CHECK" | tail -n1)
+          
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "  ℹ️  Bucket '${BUCKET_NAME}' not found (may already be deleted)"
+            exit 0
+          fi
+          
+          # Delete all objects in bucket using AWS CLI (R2 is S3-compatible)
+          # Install AWS CLI if not present
+          if ! command -v aws &> /dev/null; then
+            echo "  Installing AWS CLI..."
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip -q awscliv2.zip
+            sudo ./aws/install
+            rm -rf aws awscliv2.zip
+          fi
+          
+          # Configure AWS CLI for R2
+          source tofu/.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          export AWS_DEFAULT_REGION="auto"
+          
+          R2_ENDPOINT="https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          
+          # List objects to see what's in the bucket
+          echo "  Checking bucket contents..."
+          OBJECT_COUNT=$(aws s3 ls "s3://${BUCKET_NAME}" --recursive --endpoint-url="$R2_ENDPOINT" 2>/dev/null | wc -l || echo "0")
+          echo "  Found $OBJECT_COUNT objects in bucket"
+
+          # Delete all objects and versions (R2 may have versioning enabled)
+          echo "  Deleting all objects and versions..."
+          aws s3api list-object-versions \
+            --bucket "${BUCKET_NAME}" \
+            --endpoint-url="$R2_ENDPOINT" \
+            --output=json 2>/dev/null | \
+          jq -r '.Versions[]?, .DeleteMarkers[]? | "\(.Key)\t\(.VersionId)"' | \
+          while IFS=$'\t' read -r key versionId; do
+            if [ -n "$key" ]; then
+              echo "    Deleting: $key (version: $versionId)"
+              aws s3api delete-object \
+                --bucket "${BUCKET_NAME}" \
+                --key "$key" \
+                --version-id "$versionId" \
+                --endpoint-url="$R2_ENDPOINT" >/dev/null 2>&1
+            fi
+          done || echo "  No versioned objects to delete"
+
+          # Delete remaining objects
+          aws s3 rm "s3://${BUCKET_NAME}" --recursive --endpoint-url="$R2_ENDPOINT" || echo "  No regular objects to delete"
+
+          # Delete the bucket itself
+          echo "  Deleting bucket..."
+          DELETE_RESPONSE=$(curl -s -X DELETE \
+            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/r2/buckets/${BUCKET_NAME}" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json")
+
+          if echo "$DELETE_RESPONSE" | grep -q '"success":true'; then
+            echo "  ✅ R2 bucket deleted successfully"
+          else
+            ERROR_MSG=$(echo "$DELETE_RESPONSE" | jq -r '.errors[0].message // "Unknown error"' 2>/dev/null || echo "Unknown error")
+            echo "  ⚠️  Failed to delete bucket: ${ERROR_MSG}"
+            echo "     Manual cleanup may be required: https://dash.cloudflare.com > R2 > ${BUCKET_NAME}"
+            echo "     Note: Bucket not being deleted won't prevent redeployment"
+          fi
+
+      - name: Confirm destruction
+        run: |
+          echo ""
+          echo "🗑️  All infrastructure has been destroyed:"
+          echo "   - Hetzner Cloud server"
+          echo "   - Cloudflare Tunnel"
+          echo "   - Cloudflare DNS records"
+          echo "   - Cloudflare Access policies"
+          echo "   - Control Plane (Pages + Worker + D1)"
+          echo "   - Hetzner Object Storage buckets (LakeFS, General)"
+          echo "   - R2 state bucket and contents"
+          echo "   - R2 API tokens from Cloudflare"
+          echo "   - R2 GitHub Secrets (if GH_SECRETS_TOKEN configured)"
+          echo ""
+          echo "To redeploy, run the Initial Setup workflow."

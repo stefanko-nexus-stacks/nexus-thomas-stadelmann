@@ -1,0 +1,465 @@
+# =============================================================================
+# Nexus-Stack Services Configuration
+# =============================================================================
+# This file defines service metadata only. Runtime state (enabled/disabled) 
+# is stored in Cloudflare D1 and managed via the Control Plane.
+#
+# Each service creates:
+# - Cloudflare DNS record: <subdomain>.<domain>
+# - Cloudflare Tunnel route to localhost:<port>
+# - Cloudflare Access policy (if public = false)
+#
+# Note: You also need stacks/<service>/docker-compose.yml for the container!
+#
+# CORE SERVICES (core: true):
+# - infisical: Required for secret management
+# - info: Dashboard showing all services
+# These services are automatically enabled during initial setup and cannot be
+# disabled from the Control Plane.
+# =============================================================================
+
+services:
+  adminer:
+    subdomain: "adminer"
+    port: 8888
+    public: false
+    description: "Lightweight database management tool supporting PostgreSQL, MySQL, SQLite, and more."
+    image: "adminer:latest"
+
+  cloudbeaver:
+    subdomain: "cloudbeaver"
+    port: 8978
+    public: false
+    description: "Web-based database management tool supporting PostgreSQL, MySQL, SQL Server, and more."
+    image: "dbeaver/cloudbeaver:24"
+
+  clickhouse:
+    subdomain: "clickhouse"
+    port: 8123
+    public: false
+    description: "Fast, open-source columnar database for real-time analytics and OLAP queries."
+    image: "clickhouse/clickhouse-server:25.8.16.34"
+    tcp_ports:
+      native: 9004
+
+  code-server:
+    subdomain: "code"
+    port: 8100
+    public: false
+    description: "VS Code in the browser for remote development."
+    image: "codercom/code-server:latest"
+
+  dify:
+    subdomain: "dify"
+    port: 8501
+    public: false
+    description: "AI workflow builder for LLM applications, RAG pipelines, and agentic workflows."
+    image: "langgenius/dify-api:1.13.0"
+    support_images:
+      dify-web: "langgenius/dify-web:1.13.0"
+      dify-nginx: "nginx:alpine"
+      dify-postgres: "postgres:15-alpine"
+      dify-redis: "redis:6-alpine"
+      dify-weaviate: "semitechnologies/weaviate:1.27.0"
+      dify-sandbox: "langgenius/dify-sandbox:0.2.12"
+      dify-ssrf-proxy: "ubuntu/squid:latest"
+      dify-plugin-daemon: "langgenius/dify-plugin-daemon:0.5.3-local"
+
+  drawio:
+    subdomain: "drawio"
+    port: 8083
+    public: false
+    description: "Flowchart and diagramming tool for creating technical diagrams, flowcharts, and UML diagrams."
+    image: "jgraph/drawio:latest"
+
+  excalidraw:
+    subdomain: "excalidraw"
+    port: 8082
+    public: false
+    description: "Virtual whiteboard for sketching hand-drawn diagrams with collaboration support."
+    image: "excalidraw/excalidraw:latest"
+
+  filestash:
+    subdomain: "filestash"
+    port: 8334
+    public: false
+    description: "Web-based file manager with S3/FTP/SFTP/WebDAV backend support."
+    image: "machines/filestash:latest"
+
+  garage:
+    subdomain: "garage"
+    port: 3909
+    public: false
+    description: "Lightweight S3-compatible object storage designed for self-hosting."
+    image: "dxflrs/garage:v2.2.0"
+    support_images:
+      webui: "khairul169/garage-webui:latest"
+    tcp_ports:
+      s3-api: 3900
+
+  git-proxy:
+    subdomain: "git"
+    port: 3201
+    public: true
+    description: "Public Git HTTPS proxy for external tools (Databricks, Git Desktop). Forwards to Gitea with built-in authentication."
+    image: "nginx:alpine"
+
+  gitea:
+    subdomain: "gitea"
+    port: 3200
+    public: false
+    core: true
+    description: "Self-hosted Git service with pull requests, code review, and CI/CD."
+    image: "gitea/gitea:1.23"
+    support_images:
+      postgres: "postgres:16-alpine"
+
+  grafana:
+    subdomain: "grafana"
+    port: 3100
+    public: false
+    core: true
+    description: "Observability platform for metrics, logs, and traces visualization."
+    image: "grafana/grafana:11.6"
+    support_images:
+      prometheus: "prom/prometheus:v3.9.1"
+      loki: "grafana/loki:3"
+      promtail: "grafana/promtail:3"
+      cadvisor: "ghcr.io/google/cadvisor:0.56"
+      node-exporter: "prom/node-exporter:v1.10.2"
+
+  hoppscotch:
+    subdomain: "hoppscotch"
+    port: 3003
+    public: false
+    description: "Open-source API testing platform (Postman alternative)."
+    image: "hoppscotch/hoppscotch:2025.12.1"
+    support_images:
+      postgres: "postgres:15-alpine"
+
+  info:
+    subdomain: "info"
+    port: 8090
+    public: false
+    core: true
+    description: "Landing page showing all your Nexus Stack services and their status."
+    image: "nginx:alpine"
+
+  infisical:
+    subdomain: "infisical"
+    port: 8070
+    public: false
+    core: true
+    description: "Open-source secret management platform for teams."
+    image: "infisical/infisical:v0.155.5"
+    support_images:
+      postgres: "postgres:14-alpine"
+      redis: "redis:7-alpine"
+
+  it-tools:
+    subdomain: "it-tools"
+    port: 8080
+    public: false
+    description: "Collection of handy online tools for developers - encoders, converters, generators, and more."
+    image: "corentinth/it-tools:latest"
+
+  jupyter:
+    subdomain: "jupyter"
+    port: 8087
+    public: false
+    description: "Interactive PySpark notebook platform with Spark SQL support and cluster connectivity."
+    image: "quay.io/jupyter/pyspark-notebook:python-3.13"
+
+  kafka-ui:
+    subdomain: "kafka-ui"
+    port: 8181
+    public: false
+    description: "Modern web UI for Apache Kafka / Redpanda management."
+    image: "provectuslabs/kafka-ui:latest"
+
+  lakefs:
+    subdomain: "lakefs"
+    port: 8000
+    public: false
+    description: "Git-like version control for data lakes with S3-compatible gateway (Hetzner Object Storage backend)."
+    image: "treeverse/lakefs:1.73.0"
+    support_images:
+      postgres: "postgres:16-alpine"
+    tcp_ports:
+      s3-gateway: 8000
+
+  kestra:
+    subdomain: "kestra"
+    port: 8085
+    public: false
+    description: "Open-source orchestration and scheduling platform for data pipelines and workflows."
+    image: "kestra/kestra:v1.0"
+    support_images:
+      postgres: "postgres:16-alpine"
+
+  mage:
+    subdomain: "mage"
+    port: 6789
+    public: false
+    description: "Modern data pipeline tool - build, run, and manage pipelines for ETL/ELT workflows."
+    image: "mageai/mageai:latest"
+    support_images:
+      postgres: "postgres:14-alpine"
+
+  mailpit:
+    subdomain: "mailpit"
+    port: 8025
+    public: false
+    description: "Email testing tool that catches all outgoing emails for inspection and testing."
+    image: "axllent/mailpit:v1.28"
+
+  marimo:
+    subdomain: "marimo"
+    port: 2718
+    public: false
+    description: "Reactive Python notebook with SQL support, reproducible and git-friendly."
+    image: "ghcr.io/marimo-team/marimo:latest-sql"
+
+  meltano:
+    port: 5000
+    public: false
+    internal_only: true
+    description: "Open-source CLI data integration platform for building modular data pipelines."
+    image: "meltano/meltano:v4.0"
+    support_images:
+      postgres: "postgres:16-alpine"
+
+  metabase:
+    subdomain: "metabase"
+    port: 3000
+    public: false
+    description: "Open-source business intelligence and analytics tool for data visualization."
+    image: "metabase/metabase:v0.58.x"
+    support_images:
+      postgres: "postgres:16-alpine"
+
+  minio:
+    subdomain: "minio"
+    port: 9001
+    public: false
+    description: "High-performance S3-compatible object storage for data lakes, backups, and ML models."
+    image: "quay.io/minio/minio:RELEASE.2025-10-15T17-29-55Z"
+    tcp_ports:
+      s3-api: 9000
+
+  n8n:
+    subdomain: "n8n"
+    port: 5678
+    public: false
+    description: "Workflow automation tool with 400+ integrations for connecting apps and services."
+    image: "n8nio/n8n:1"
+    support_images:
+      postgres: "postgres:16-alpine"
+
+  nocodb:
+    subdomain: "nocodb"
+    port: 8091
+    public: false
+    description: "Open-source Airtable alternative that turns any database into a smart spreadsheet."
+    image: "nocodb/nocodb:0.301.2"
+    support_images:
+      postgres: "postgres:16-alpine"
+
+  ollama:
+    subdomain: "ollama"
+    port: 8093
+    public: false
+    description: "Local LLM inference with Open WebUI chat interface (Ollama backend)."
+    image: "ghcr.io/open-webui/open-webui:v0.8.3"
+    support_images:
+      ollama: "ollama/ollama:0.15.1"
+
+  openmetadata:
+    subdomain: "openmetadata"
+    port: 8585
+    public: false
+    description: "Open-source metadata management platform for data discovery, governance, and quality."
+    image: "docker.getcollate.io/openmetadata/server:1.6.6"
+    support_images:
+      ingestion: "docker.getcollate.io/openmetadata/ingestion:1.6.6"
+      elasticsearch: "docker.elastic.co/elasticsearch/elasticsearch:8.11.4"
+      postgres: "postgres:16-alpine"
+
+  rustfs:
+    subdomain: "rustfs"
+    port: 9002
+    public: false
+    description: "Rust-based S3-compatible object storage (MinIO alternative) with web console."
+    image: "rustfs/rustfs:1.0.0-alpha.82"
+    tcp_ports:
+      s3-api: 9003
+
+  s3manager:
+    subdomain: "s3manager"
+    port: 8086
+    public: false
+    description: "Web-based S3 bucket browser and manager for Hetzner Object Storage."
+    image: "cloudlena/s3manager:latest"
+
+  portainer:
+    subdomain: "portainer"
+    port: 9090
+    public: false
+    description: "Docker container management UI for easy deployment and monitoring."
+    image: "portainer/portainer-ce:lts"
+
+  pgadmin:
+    subdomain: "pgadmin"
+    port: 5050
+    public: false
+    description: "Web-based PostgreSQL administration tool for managing databases and running queries."
+    image: "dpage/pgadmin4:9"
+
+  postgres:
+    port: 5432
+    public: false
+    internal_only: true
+    description: "PostgreSQL database server - accessible only internally or via pgAdmin/Adminer."
+    image: "postgres:17-alpine"
+    tcp_ports:
+      postgres: 5432
+
+  prefect:
+    subdomain: "prefect"
+    port: 4200
+    public: false
+    description: "Modern Python-native workflow orchestration for data pipelines and automation."
+    image: "prefecthq/prefect:3-latest"
+    support_images:
+      postgres: "postgres:16-alpine"
+
+  quickwit:
+    subdomain: "quickwit"
+    port: 8092
+    public: false
+    description: "Cloud-native search engine for log management and analytics on object storage."
+    image: "quickwit/quickwit:0.8.1"
+
+  redpanda:
+    subdomain: "redpanda"
+    port: 9644
+    public: false
+    description: "Kafka-compatible streaming platform that is simpler, faster, and more cost-effective."
+    image: "redpandadata/redpanda:v24.3"
+    tcp_ports:
+      kafka: 9092
+      schema-registry: 8081
+
+  seaweedfs:
+    port: 8888
+    public: false
+    internal_only: true
+    description: "SeaweedFS distributed object storage (base service - access via filer or manager)"
+    image: "chrislusf/seaweedfs:3.82"
+
+  seaweedfs-filer:
+    subdomain: "seaweedfs"
+    port: 8888
+    stack: "seaweedfs"
+    public: false
+    description: "SeaweedFS file browser with upload capability - the main interface for managing files."
+    image: "chrislusf/seaweedfs:3.82"
+    tcp_ports:
+      s3-api: 8333
+
+  seaweedfs-manager:
+    subdomain: "seaweedfs-manager"
+    port: 9333
+    stack: "seaweedfs"
+    public: false
+    description: "SeaweedFS cluster statistics and health monitoring (read-only dashboard)."
+    image: "chrislusf/seaweedfs:3.82"
+
+  redpanda-console:
+    subdomain: "redpanda-console"
+    port: 8180
+    public: false
+    description: "Web UI for managing and debugging Redpanda/Kafka workloads."
+    image: "redpandadata/console:v2.8"
+
+  redpanda-connect:
+    subdomain: "redpanda-connect"
+    port: 4195
+    public: false
+    description: "Declarative data streaming framework for real-time pipelines."
+    image: "redpandadata/connect:4.43.0"
+
+  redpanda-datagen:
+    subdomain: "redpanda-datagen"
+    port: 4196
+    public: false
+    description: "Test data generator for Redpanda topics."
+    image: "redpandadata/connect:4.43.0"
+
+  soda:
+    port: 5002
+    public: false
+    internal_only: true
+    description: "CLI-based data quality testing tool using SodaCL checks for database validation."
+    image: "soda-core-arm64:3.3.7"
+    support_images:
+      postgres: "postgres:16-alpine"
+
+  spark:
+    subdomain: "spark"
+    port: 8088
+    public: false
+    description: "Distributed data processing engine with standalone cluster (Master + Worker)."
+    image: "nexus-spark:4.1.1-python3.13"
+    support_images:
+      spark-worker: "nexus-spark:4.1.1-python3.13"
+
+  trino:
+    subdomain: "trino"
+    port: 8060
+    public: false
+    description: "Distributed SQL query engine for querying data across multiple sources (ClickHouse, PostgreSQL, and more)."
+    image: "trinodb/trino:479"
+
+  uptime-kuma:
+    subdomain: "uptime-kuma"
+    port: 3001
+    public: false
+    description: "A fancy self-hosted monitoring tool for tracking service uptime and status."
+    image: "louislam/uptime-kuma:2"
+
+  wetty:
+    subdomain: "wetty"
+    port: 3002
+    public: false
+    admin_only: true
+    description: "Web-based SSH terminal for browser access to your server."
+    image: "wettyoss/wetty:latest"
+
+  wikijs:
+    subdomain: "wiki"
+    port: 3005
+    public: false
+    description: "Open-source wiki and knowledge base platform with Markdown, visual editor, and multi-language support."
+    image: "requarks/wiki:2.5.306"
+    support_images:
+      wikijs-postgres: "postgres:16-alpine"
+
+  woodpecker:
+    subdomain: "woodpecker"
+    port: 8084
+    public: false
+    description: "Lightweight Docker-native CI/CD engine with pipeline-as-code."
+    image: "woodpeckerci/woodpecker-server:v3.13.0"
+    support_images:
+      woodpecker-agent: "woodpeckerci/woodpecker-agent:v3.13.0"
+
+  windmill:
+    subdomain: "windmill"
+    port: 8200
+    public: false
+    description: "Open-source workflow engine for scripts, workflows, and UIs with built-in code editor."
+    image: "ghcr.io/windmill-labs/windmill:1.624.0"
+    support_images:
+      lsp: "ghcr.io/windmill-labs/windmill-lsp:latest"
+      postgres: "postgres:16-alpine"

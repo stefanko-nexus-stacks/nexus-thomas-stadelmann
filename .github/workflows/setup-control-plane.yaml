@@ -1,0 +1,722 @@
+name: Setup Nexus Control Plane
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    outputs:
+      r2_access_key_id:
+        description: 'R2 Access Key ID (for spin-up workflow)'
+        value: ${{ jobs.deploy.outputs.r2_access_key_id }}
+      r2_secret_access_key:
+        description: 'R2 Secret Access Key (for spin-up workflow)'
+        value: ${{ jobs.deploy.outputs.r2_secret_access_key }}
+      ssh_pubkey:
+        description: 'SSH Public Key (for spin-up workflow)'
+        value: ${{ jobs.deploy.outputs.ssh_pubkey }}
+      ssh_private_key:
+        description: 'SSH Private Key (for spin-up during initial setup)'
+        value: ${{ jobs.deploy.outputs.ssh_private_key }}
+
+permissions:
+  contents: read
+  actions: write
+
+# NOTE: No concurrency here - handled by calling workflow (initial-setup.yaml)
+# When called directly via workflow_dispatch, runs without concurrency lock
+
+jobs:
+  deploy:
+    name: Setup Nexus Control Plane
+    runs-on: ubuntu-latest
+    outputs:
+      r2_access_key_id: ${{ steps.r2_credentials.outputs.r2_access_key_id }}
+      r2_secret_access_key: ${{ steps.r2_credentials.outputs.r2_secret_access_key }}
+      ssh_pubkey: ${{ steps.ssh_key.outputs.ssh_pubkey }}
+      ssh_private_key: ${{ steps.ssh_key.outputs.ssh_private_key }}
+    env:
+      TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      TF_VAR_cloudflare_zone_id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+      TF_VAR_hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
+      TF_VAR_domain: ${{ secrets.DOMAIN }}
+      TF_VAR_access_emails: ${{ secrets.ACCESS_EMAILS }}
+      TF_VAR_infisical_token: ${{ secrets.INFISICAL_TOKEN }}
+      TF_VAR_dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+      TF_VAR_dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
+      TF_VAR_github_owner: ${{ github.repository_owner }}
+      TF_VAR_github_repo: ${{ github.event.repository.name }}
+      # Hetzner Object Storage (for LakeFS bucket)
+      TF_VAR_hetzner_object_storage_access_key: ${{ secrets.HETZNER_OBJECT_STORAGE_ACCESS_KEY }}
+      TF_VAR_hetzner_object_storage_secret_key: ${{ secrets.HETZNER_OBJECT_STORAGE_SECRET_KEY }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: 1.10.0
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/
+
+      - name: Generate SSH key for server access
+        id: ssh_key
+        env:
+          GH_TOKEN: ${{ secrets.GH_SECRETS_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          # Ensure .ssh directory exists
+          mkdir -p ~/.ssh
+          
+          # Check if SSH key already exists in secrets
+          if [ -n "${{ secrets.SSH_PRIVATE_KEY }}" ]; then
+            echo "✅ SSH key already exists in secrets - reusing"
+            echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+            echo "${{ secrets.SSH_PUBLIC_KEY }}" > ~/.ssh/id_ed25519.pub
+            chmod 600 ~/.ssh/id_ed25519
+            chmod 644 ~/.ssh/id_ed25519.pub
+            echo "ssh_key_created=false" >> $GITHUB_OUTPUT
+          else
+            echo "🔑 Generating new SSH key..."
+            mkdir -p ~/.ssh
+            ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -C "nexus-stack"
+            chmod 600 ~/.ssh/id_ed25519
+            chmod 644 ~/.ssh/id_ed25519.pub
+            
+            # Save SSH Private Key as GitHub Secret
+            # Note: Public Key is not stored as secret - it can be derived from private key
+            SSH_PRIVATE_KEY=$(cat ~/.ssh/id_ed25519)
+            
+            if [ -n "$GH_TOKEN" ]; then
+              echo "🔐 Saving SSH keys to GitHub Secrets..."
+              # Note: We only save the Private Key as a secret. 
+              # The Public Key is passed as an output and not stored as a secret to avoid 
+              # "Skip output... contains secret" warnings in GitHub Actions.
+              if gh secret set SSH_PRIVATE_KEY -b "$SSH_PRIVATE_KEY" 2>/dev/null; then
+                echo "✅ SSH Private Key saved to GitHub Secrets"
+                echo "ssh_key_created=true" >> $GITHUB_OUTPUT
+              else
+                echo "⚠️  Failed to save SSH keys - GH_SECRETS_TOKEN may need 'repo' scope"
+                echo "ssh_key_created=false" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "⚠️  GH_SECRETS_TOKEN not set - SSH keys not saved"
+              echo "ssh_key_created=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+          
+          # Export public key for output (named ssh_pubkey to avoid GitHub Actions secret warning)
+          echo "ssh_pubkey=$(cat ~/.ssh/id_ed25519.pub)" >> $GITHUB_OUTPUT
+
+          # Export private key for output (for initial-setup passthrough to spin-up)
+          # Note: Don't mask private key here - masking prevents it from being
+          # passed as workflow output (GitHub blocks outputs containing masked values)
+          # AND can corrupt R2 credentials if base64 substrings match.
+          # The key will be masked by the receiving workflow (spin-up.yml) when used
+          {
+            echo "ssh_private_key<<SSHEOF"
+            cat ~/.ssh/id_ed25519
+            echo "SSHEOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Compute resource prefix
+        id: prefix
+        run: |
+          # Derive resource prefix from domain (e.g., stefanko.ch -> nexus-stefanko-ch)
+          DOMAIN="${{ secrets.DOMAIN }}"
+          RESOURCE_PREFIX="nexus-${DOMAIN//./-}"
+          PROJECT_NAME="${RESOURCE_PREFIX}-control"
+          echo "resource_prefix=$RESOURCE_PREFIX" >> $GITHUB_OUTPUT
+          echo "project_name=$PROJECT_NAME" >> $GITHUB_OUTPUT
+          echo "Resource prefix: $RESOURCE_PREFIX"
+          echo "Project name: $PROJECT_NAME"
+
+      - name: Generate config.tfvars
+        run: |
+          # Control Plane config (emails from secrets)
+          cat > tofu/control-plane/config.tfvars << EOF
+          server_type     = "cax31"
+          server_location = "fsn1"
+          domain          = "${{ secrets.DOMAIN }}"
+          admin_email     = "${{ secrets.TF_VAR_admin_email }}"
+          user_email      = "${{ secrets.TF_VAR_user_email }}"
+          github_owner    = "${{ github.repository_owner }}"
+          github_repo     = "${{ github.event.repository.name }}"
+          EOF
+          sed -i 's/^          //' tofu/control-plane/config.tfvars
+
+      - name: Check if R2 credentials exist
+        id: check_r2
+        run: |
+          if [ -n "${{ secrets.R2_ACCESS_KEY_ID }}" ] && [ -n "${{ secrets.R2_SECRET_ACCESS_KEY }}" ]; then
+            echo "r2_exists=true" >> $GITHUB_OUTPUT
+            echo "✅ R2 credentials found in secrets"
+          else
+            echo "r2_exists=false" >> $GITHUB_OUTPUT
+            echo "📦 No R2 credentials - will create new ones"
+          fi
+
+      - name: Initialize R2 (first-time setup)
+        if: steps.check_r2.outputs.r2_exists == 'false'
+        id: init_r2
+        env:
+          GH_TOKEN: ${{ secrets.GH_SECRETS_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🪣 Creating R2 bucket and credentials..."
+          r2_saved=false
+          
+          # Run the init script
+          chmod +x scripts/init-r2-state.sh
+          if ! ./scripts/init-r2-state.sh; then
+            echo "❌ init-r2-state.sh script failed"
+            exit 1
+          fi
+          
+          # Verify credentials file was created
+          if [ ! -f tofu/.r2-credentials ]; then
+            echo "❌ R2 credentials file not found after running init script"
+            echo "   Expected location: tofu/.r2-credentials"
+            echo "   Current directory: $(pwd)"
+            echo "   Contents of tofu/ directory:"
+            ls -la tofu/ 2>/dev/null || echo "   (tofu/ directory does not exist)"
+            exit 1
+          fi
+          
+          # Read the generated credentials
+          if [ -f tofu/.r2-credentials ]; then
+            source tofu/.r2-credentials
+            
+            # Check if we have a token to auto-save secrets
+            if [ -n "$GH_TOKEN" ]; then
+              echo "🔐 Auto-saving R2 credentials as GitHub Secrets..."
+              
+              SECRET_ERROR=""
+              if ! gh secret set R2_ACCESS_KEY_ID -b "$R2_ACCESS_KEY_ID" 2>&1 | tee /tmp/gh-secret-access.log; then
+                SECRET_ERROR=$(cat /tmp/gh-secret-access.log 2>/dev/null || echo "Unknown error")
+              fi
+              
+              if [ -z "$SECRET_ERROR" ]; then
+                if ! gh secret set R2_SECRET_ACCESS_KEY -b "$R2_SECRET_ACCESS_KEY" 2>&1 | tee /tmp/gh-secret-secret.log; then
+                  SECRET_ERROR=$(cat /tmp/gh-secret-secret.log 2>/dev/null || echo "Unknown error")
+                fi
+              fi
+              
+              if [ -z "$SECRET_ERROR" ]; then
+                echo "✅ R2 credentials saved to GitHub Secrets automatically!"
+                echo ""
+                echo "Future deployments will use these credentials."
+                r2_saved=true
+              else
+                echo "⚠️  Failed to auto-save secrets: $SECRET_ERROR"
+                echo ""
+                echo "Please save these credentials manually in GitHub Secrets:"
+                echo "  R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID"
+                echo "  R2_SECRET_ACCESS_KEY=*** (check workflow logs or tofu/.r2-credentials file)"
+                echo ""
+                echo "Or configure GH_SECRETS_TOKEN with 'repo' scope and 'write:secrets' permission"
+              fi
+            else
+              echo ""
+              echo "╔══════════════════════════════════════════════════════════════════════════════╗"
+              echo "║  ⚠️  GH_SECRETS_TOKEN not configured - manual setup required                ║"
+              echo "╠══════════════════════════════════════════════════════════════════════════════╣"
+              echo "║                                                                              ║"
+              echo "║  Please save these credentials manually in GitHub Secrets:                  ║"
+              echo "║  R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID"
+              echo "║  R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY"
+              echo "║                                                                              ║"
+              echo "║  To enable auto-saving, create a Personal Access Token:                     ║"
+              echo "║  GitHub → Settings → Developer settings → Personal access tokens            ║"
+              echo "║  Required scope: 'repo' (or fine-grained with 'Secrets' permission)         ║"
+              echo "║  Save as: GH_SECRETS_TOKEN                                                  ║"
+              echo "║                                                                              ║"
+              echo "╚══════════════════════════════════════════════════════════════════════════════╝"
+            fi
+            
+            echo "r2_saved=$r2_saved" >> $GITHUB_OUTPUT
+            
+            # Export for this run
+            echo "r2_access_key=$R2_ACCESS_KEY_ID" >> $GITHUB_OUTPUT
+            echo "r2_secret_key=$R2_SECRET_ACCESS_KEY" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Failed to create R2 credentials"
+            exit 1
+          fi
+
+      - name: Create R2 credentials from secrets
+        if: steps.check_r2.outputs.r2_exists == 'true'
+        run: |
+          mkdir -p tofu
+          # Trim whitespace and newlines from secrets to avoid auth issues
+          R2_ACCESS_KEY_ID=$(echo -n "${{ secrets.R2_ACCESS_KEY_ID }}" | tr -d '[:space:]')
+          R2_SECRET_ACCESS_KEY=$(echo -n "${{ secrets.R2_SECRET_ACCESS_KEY }}" | tr -d '[:space:]')
+          
+          # Generate dynamic bucket name from domain
+          BUCKET_NAME=$(echo "${{ secrets.DOMAIN }}" | tr '.' '-')-terraform-state
+          echo "📦 Using bucket: $BUCKET_NAME"
+          
+          cat > tofu/.r2-credentials << EOF
+          R2_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}"
+          R2_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY}"
+          EOF
+          sed -i 's/^          //' tofu/.r2-credentials
+
+          cat > tofu/backend.hcl << EOF
+          endpoints = {
+            s3 = "https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          }
+          bucket = "${BUCKET_NAME}"
+          EOF
+          sed -i 's/^          //' tofu/backend.hcl
+          
+          # Debug: Verify credentials are set (without exposing values)
+          echo "✅ R2 credentials file created"
+          echo "   R2_ACCESS_KEY_ID length: ${#R2_ACCESS_KEY_ID}"
+          echo "   R2_SECRET_ACCESS_KEY length: ${#R2_SECRET_ACCESS_KEY}"
+
+      - name: Validate R2 credentials
+        if: steps.check_r2.outputs.r2_exists == 'true'
+        id: validate_r2
+        env:
+          GH_TOKEN: ${{ secrets.GH_SECRETS_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          source tofu/.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+
+          R2_ENDPOINT="https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+
+          echo "🔍 Validating R2 credentials via list-buckets against $R2_ENDPOINT..."
+          # Use if-else to prevent set -e from killing the script on aws failure
+          if VALIDATION=$(aws s3api list-buckets --endpoint-url="$R2_ENDPOINT" --region auto 2>&1); then
+            echo "✅ R2 credentials are valid"
+            echo "r2_valid=true" >> $GITHUB_OUTPUT
+          else
+            VALIDATION_STATUS=$?
+            echo "❌ R2 credentials are invalid (exit code $VALIDATION_STATUS)"
+            echo "$VALIDATION"
+            echo "r2_valid=false" >> $GITHUB_OUTPUT
+
+            # Delete stale GitHub Secrets so init-r2-state.sh can recreate them
+            if [ -n "$GH_TOKEN" ]; then
+              gh secret delete R2_ACCESS_KEY_ID 2>/dev/null || true
+              gh secret delete R2_SECRET_ACCESS_KEY 2>/dev/null || true
+              echo "🗑️  Stale R2 secrets deleted from GitHub"
+            fi
+          fi
+
+      - name: Recreate R2 credentials (invalid token detected)
+        if: steps.validate_r2.outputs.r2_valid == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GH_SECRETS_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🔄 Recreating R2 token and credentials..."
+          rm -f tofu/.r2-credentials  # Remove stale credentials so init script creates new token
+          chmod +x scripts/init-r2-state.sh
+          if ! ./scripts/init-r2-state.sh; then
+            echo "❌ init-r2-state.sh failed"
+            exit 1
+          fi
+
+          # Save new credentials to GitHub Secrets
+          if [ -f tofu/.r2-credentials ] && [ -n "$GH_TOKEN" ]; then
+            source tofu/.r2-credentials
+            gh secret set R2_ACCESS_KEY_ID -b "$R2_ACCESS_KEY_ID" 2>/dev/null || true
+            gh secret set R2_SECRET_ACCESS_KEY -b "$R2_SECRET_ACCESS_KEY" 2>/dev/null || true
+            echo "✅ New R2 credentials saved to GitHub Secrets"
+          fi
+
+      - name: Export R2 credentials for spin-up workflow
+        id: r2_credentials
+        run: |
+          # Check if credentials file exists (from either init_r2 or Create R2 credentials step)
+          if [ ! -f tofu/.r2-credentials ]; then
+            echo "❌ R2 credentials file not found!"
+            echo "   Expected location: tofu/.r2-credentials"
+            exit 1
+          fi
+          
+          source tofu/.r2-credentials
+          
+          # Verify credentials were loaded
+          if [ -z "$R2_ACCESS_KEY_ID" ] || [ -z "$R2_SECRET_ACCESS_KEY" ]; then
+            echo "❌ R2 credentials are empty after sourcing file!"
+            exit 1
+          fi
+          
+          # Note: Don't mask credentials here - masking prevents them from being
+          # passed as workflow outputs (GitHub blocks outputs containing masked values)
+          # The credentials will be masked by the receiving workflow when used
+          # Export as outputs for the calling workflow
+          echo "r2_access_key_id=$R2_ACCESS_KEY_ID" >> $GITHUB_OUTPUT
+          echo "r2_secret_access_key=$R2_SECRET_ACCESS_KEY" >> $GITHUB_OUTPUT
+          echo "✅ R2 credentials exported for spin-up workflow"
+
+      - name: Initialize OpenTofu for Control Plane
+        run: |
+          cd tofu/control-plane
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          
+          # Create backend config for control-plane with dynamic bucket name
+          BUCKET_NAME=$(echo "${{ secrets.DOMAIN }}" | tr '.' '-')-terraform-state
+          cat > backend.hcl << EOF
+          endpoints = {
+            s3 = "https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          }
+          bucket = "${BUCKET_NAME}"
+          EOF
+          sed -i 's/^          //' backend.hcl
+          
+          tofu init -backend-config=backend.hcl
+
+      - name: Clean up orphaned Hetzner Object Storage buckets
+        run: |
+          # If destroy-all cleared Terraform state but failed to delete the Hetzner
+          # Object Storage buckets, the next initial-setup fails because the minio
+          # provider tries to CREATE buckets that already exist. Stale buckets from
+          # a previous deployment have no value on a fresh setup, so delete them here
+          # to let Terraform create them cleanly.
+
+          if [ -z "${{ secrets.HETZNER_OBJECT_STORAGE_ACCESS_KEY }}" ]; then
+            echo "  ℹ️  Hetzner Object Storage not configured - skipping"
+            exit 0
+          fi
+
+          DOMAIN="${{ secrets.DOMAIN }}"
+          RESOURCE_PREFIX="nexus-${DOMAIN//./-}"
+          HZ_ENDPOINT="https://fsn1.your-objectstorage.com"
+
+          HZ_ACCESS_KEY="${{ secrets.HETZNER_OBJECT_STORAGE_ACCESS_KEY }}"
+          HZ_SECRET_KEY="${{ secrets.HETZNER_OBJECT_STORAGE_SECRET_KEY }}"
+
+          cd tofu/control-plane
+          source ../.r2-credentials
+          # R2 credentials for tofu state commands
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+
+          for BUCKET in "${RESOURCE_PREFIX}-lakefs" "${RESOURCE_PREFIX}"; do
+            RESOURCE=$([ "$BUCKET" = "${RESOURCE_PREFIX}-lakefs" ] \
+              && echo "minio_s3_bucket.lakefs[0]" \
+              || echo "minio_s3_bucket.general[0]")
+            RES_NAME=$([ "$BUCKET" = "${RESOURCE_PREFIX}-lakefs" ] && echo "lakefs" || echo "general")
+
+            if tofu state show "$RESOURCE" >/dev/null 2>&1; then
+              # Resource is in state - check if it is tainted (must be replaced)
+              INSTANCE_STATUS=$(tofu state pull 2>/dev/null | jq -r \
+                --arg name "$RES_NAME" \
+                '.resources[]? | select(.type == "minio_s3_bucket" and .name == $name) | .instances[]?.status // "ok"' \
+                2>/dev/null | head -1 || echo "ok")
+
+              if [ "$INSTANCE_STATUS" != "tainted" ]; then
+                echo "  $BUCKET: in state and healthy - skipping"
+                continue
+              fi
+
+              echo "  $BUCKET: in state but tainted - removing for clean replacement..."
+              AWS_ACCESS_KEY_ID="$HZ_ACCESS_KEY" \
+              AWS_SECRET_ACCESS_KEY="$HZ_SECRET_KEY" \
+              AWS_DEFAULT_REGION="eu-central-1" \
+              aws s3 rm "s3://${BUCKET}" --recursive \
+                --endpoint-url="$HZ_ENDPOINT" 2>/dev/null || true
+              AWS_ACCESS_KEY_ID="$HZ_ACCESS_KEY" \
+              AWS_SECRET_ACCESS_KEY="$HZ_SECRET_KEY" \
+              AWS_DEFAULT_REGION="eu-central-1" \
+              aws s3api delete-bucket --bucket "$BUCKET" \
+                --endpoint-url="$HZ_ENDPOINT" 2>/dev/null || true
+              tofu state rm "$RESOURCE" 2>/dev/null || true
+              echo "  ✅ $BUCKET removed from state and Hetzner - Terraform will recreate it"
+              continue
+            fi
+
+            # Resource not in state - check if bucket exists on Hetzner (orphaned)
+            if ! AWS_ACCESS_KEY_ID="$HZ_ACCESS_KEY" \
+               AWS_SECRET_ACCESS_KEY="$HZ_SECRET_KEY" \
+               AWS_DEFAULT_REGION="eu-central-1" \
+               aws s3api head-bucket --bucket "$BUCKET" \
+               --endpoint-url="$HZ_ENDPOINT" 2>/dev/null; then
+              echo "  $BUCKET: does not exist - skipping"
+              continue
+            fi
+
+            echo "  $BUCKET: stale bucket found (not in state) - removing..."
+            AWS_ACCESS_KEY_ID="$HZ_ACCESS_KEY" \
+            AWS_SECRET_ACCESS_KEY="$HZ_SECRET_KEY" \
+            AWS_DEFAULT_REGION="eu-central-1" \
+            aws s3 rm "s3://${BUCKET}" --recursive \
+              --endpoint-url="$HZ_ENDPOINT" 2>/dev/null || true
+            if AWS_ACCESS_KEY_ID="$HZ_ACCESS_KEY" \
+               AWS_SECRET_ACCESS_KEY="$HZ_SECRET_KEY" \
+               AWS_DEFAULT_REGION="eu-central-1" \
+               aws s3api delete-bucket --bucket "$BUCKET" \
+               --endpoint-url="$HZ_ENDPOINT" 2>/dev/null; then
+              echo "  ✅ $BUCKET deleted - Terraform will recreate it"
+            else
+              echo "  ⚠️  Could not delete $BUCKET - apply may fail"
+            fi
+          done
+
+      - name: Deploy Control Plane infrastructure
+        run: |
+          cd tofu/control-plane
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+
+          echo "🏗️  Deploying Control Plane infrastructure (Cloudflare Pages + Worker)..."
+          tofu apply -var-file=config.tfvars -auto-approve
+
+          echo "✅ Control Plane infrastructure deployed"
+
+      - name: Set Scheduled Teardown Worker secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          GITHUB_TOKEN: ${{ secrets.GH_SECRETS_TOKEN }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ADMIN_EMAIL: ${{ secrets.TF_VAR_admin_email }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          echo "⚙️  Setting Scheduled Teardown Worker secrets..."
+          # Derive worker name from domain (must match Terraform naming: ${local.resource_prefix}-worker)
+          WORKER_NAME="nexus-${DOMAIN//./-}-worker"
+          GITHUB_OWNER="${{ github.repository_owner }}"
+          GITHUB_REPO="${{ github.event.repository.name }}"
+          
+          # Set secrets for the Worker (different from Pages!)
+          echo "  Setting GITHUB_TOKEN..."
+          echo "$GITHUB_TOKEN" | npx wrangler@latest secret put GITHUB_TOKEN --name="$WORKER_NAME" || echo "⚠️  Failed"
+          
+          echo "  Setting GITHUB_OWNER..."
+          echo "$GITHUB_OWNER" | npx wrangler@latest secret put GITHUB_OWNER --name="$WORKER_NAME" || echo "⚠️  Failed"
+          
+          echo "  Setting GITHUB_REPO..."
+          echo "$GITHUB_REPO" | npx wrangler@latest secret put GITHUB_REPO --name="$WORKER_NAME" || echo "⚠️  Failed"
+          
+          echo "  Setting DOMAIN..."
+          echo "$DOMAIN" | npx wrangler@latest secret put DOMAIN --name="$WORKER_NAME" || echo "⚠️  Failed"
+          
+          if [ -n "$RESEND_API_KEY" ]; then
+            echo "  Setting RESEND_API_KEY..."
+            echo "$RESEND_API_KEY" | npx wrangler@latest secret put RESEND_API_KEY --name="$WORKER_NAME" || echo "⚠️  Failed"
+          fi
+          
+          if [ -n "$ADMIN_EMAIL" ]; then
+            echo "  Setting ADMIN_EMAIL..."
+            echo "$ADMIN_EMAIL" | npx wrangler@latest secret put ADMIN_EMAIL --name="$WORKER_NAME" || echo "⚠️  Failed"
+          fi
+          
+          echo "✅ Worker secrets configured"
+
+      - name: Set Control Plane environment variables and secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          GITHUB_TOKEN: ${{ secrets.GH_SECRETS_TOKEN }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ADMIN_EMAIL: ${{ secrets.TF_VAR_admin_email }}
+          USER_EMAIL: ${{ secrets.TF_VAR_user_email }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          echo "⚙️  Setting Control Plane environment variables and secrets..."
+          PROJECT_NAME="${{ steps.prefix.outputs.project_name }}"
+          GITHUB_OWNER="${{ github.repository_owner }}"
+          GITHUB_REPO="${{ github.event.repository.name }}"
+          
+          echo "  GITHUB_OWNER: $GITHUB_OWNER"
+          echo "  GITHUB_REPO: $GITHUB_REPO"
+          echo "  DOMAIN: $DOMAIN"
+          
+          # Set all variables as Secrets via wrangler
+          # Note: Terraform sets environment_variables in Pages project config,
+          # but wrangler pages deploy doesn't use those - we need to set them as secrets
+          # Secrets work for both production and preview environments automatically
+          
+          if [ -n "$GITHUB_TOKEN" ]; then
+            echo "  Setting GITHUB_TOKEN secret..."
+            if ! echo "$GITHUB_TOKEN" | npx wrangler@latest pages secret put GITHUB_TOKEN \
+              --project-name="$PROJECT_NAME" 2>&1; then
+              echo "⚠️  Failed to set GITHUB_TOKEN secret (check token validity and project name)"
+            fi
+          else
+            echo "⚠️  GITHUB_TOKEN not provided - Control Plane will not work!"
+          fi
+          
+          echo "  Setting GITHUB_OWNER secret..."
+          echo "$GITHUB_OWNER" | npx wrangler@latest pages secret put GITHUB_OWNER \
+            --project-name="$PROJECT_NAME" || echo "⚠️  Failed to set GITHUB_OWNER (may already be set)"
+          
+          echo "  Setting GITHUB_REPO secret..."
+          echo "$GITHUB_REPO" | npx wrangler@latest pages secret put GITHUB_REPO \
+            --project-name="$PROJECT_NAME" || echo "⚠️  Failed to set GITHUB_REPO (may already be set)"
+          
+          # Set DOMAIN (required for service URLs and email sender)
+          if [ -n "$DOMAIN" ]; then
+            echo "  Setting DOMAIN secret..."
+            echo "$DOMAIN" | npx wrangler@latest pages secret put DOMAIN \
+              --project-name="$PROJECT_NAME" || echo "⚠️  Failed to set DOMAIN"
+          else
+            echo "⚠️  DOMAIN not provided - Service URLs will show 'unknown'!"
+          fi
+          
+          # Set RESEND_API_KEY for email sending (optional)
+          if [ -n "$RESEND_API_KEY" ]; then
+            echo "  Setting RESEND_API_KEY secret..."
+            echo "$RESEND_API_KEY" | npx wrangler@latest pages secret put RESEND_API_KEY \
+              --project-name="$PROJECT_NAME" || echo "⚠️  Failed to set RESEND_API_KEY"
+          else
+            echo "  ⏭️  RESEND_API_KEY not provided - email sending will be disabled"
+          fi
+          
+          # Set ADMIN_EMAIL for email sending (optional)
+          if [ -n "$ADMIN_EMAIL" ]; then
+            echo "  Setting ADMIN_EMAIL secret..."
+            echo "$ADMIN_EMAIL" | npx wrangler@latest pages secret put ADMIN_EMAIL \
+              --project-name="$PROJECT_NAME" || echo "⚠️  Failed to set ADMIN_EMAIL"
+          else
+            echo "  ⏭️  ADMIN_EMAIL not provided - email sending will be disabled"
+          fi
+          
+          # Set USER_EMAIL for email sending (optional)
+          if [ -n "$USER_EMAIL" ]; then
+            echo "  Setting USER_EMAIL secret..."
+            echo "$USER_EMAIL" | npx wrangler@latest pages secret put USER_EMAIL \
+              --project-name="$PROJECT_NAME" || echo "⚠️  Failed to set USER_EMAIL"
+          else
+            echo "  ⏭️  USER_EMAIL not provided - emails go to admin only"
+          fi
+          
+          # Set SERVER_TYPE and SERVER_LOCATION for info panel
+          echo "  Setting SERVER_TYPE secret..."
+          echo "cax31" | npx wrangler@latest pages secret put SERVER_TYPE \
+            --project-name="$PROJECT_NAME" || echo "⚠️  Failed to set SERVER_TYPE"
+          
+          echo "  Setting SERVER_LOCATION secret..."
+          echo "fsn1" | npx wrangler@latest pages secret put SERVER_LOCATION \
+            --project-name="$PROJECT_NAME" || echo "⚠️  Failed to set SERVER_LOCATION"
+          
+          echo "✅ All secrets set (applies to both production and preview environments)"
+          
+          echo ""
+          echo "✅ Setup complete"
+          echo ""
+          echo "⚠️  IMPORTANT: Environment variables are now set."
+          echo "   If Control Plane still shows errors, the deployment may need to be recreated."
+          echo "   Triggering a new deployment to ensure variables are available..."
+
+      - name: Initialize D1 Database Schema
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          echo "🗄️  Initializing D1 database schema..."
+          
+          # Get D1 database name from Terraform output
+          cd tofu/control-plane
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          D1_DATABASE_NAME=$(tofu output -raw d1_database_name)
+          echo "  D1 Database: $D1_DATABASE_NAME"
+          cd ../..
+          
+          # Initialize schema (creates tables if they don't exist)
+          npx wrangler@latest d1 execute "$D1_DATABASE_NAME" --file=control-plane/schema.sql --remote
+
+          # Schema migrations for existing databases
+          # admin_only column added for services that can only be toggled via GitHub Actions
+          npx wrangler@latest d1 execute "$D1_DATABASE_NAME" --remote --command "ALTER TABLE services ADD COLUMN admin_only INTEGER DEFAULT 0" 2>/dev/null || true
+          
+          # Store domain in D1 config (escape single quotes)
+          ESCAPED_DOMAIN=${DOMAIN//\'/\'\'}
+          npx wrangler@latest d1 execute "$D1_DATABASE_NAME" --remote --command "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES ('domain', '$ESCAPED_DOMAIN', datetime('now'))"
+          
+          # Add initial log entry (sanitize run_id as numeric)
+          RUN_ID=$(printf '%d' "${{ github.run_id }}" 2>/dev/null || echo "0")
+          npx wrangler@latest d1 execute "$D1_DATABASE_NAME" --remote --command "INSERT INTO logs (source, level, message, metadata) VALUES ('github-action', 'info', 'Control Plane initialized', '{\"workflow\": \"setup-control-plane\", \"run_id\": $RUN_ID}')"
+          
+          echo "✅ D1 database schema initialized!"
+
+      - name: Initialize services from services.yaml to D1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          echo "📋 Initializing services from services.yaml to D1..."
+          chmod +x .github/scripts/sync-deployed-state.sh
+          .github/scripts/sync-deployed-state.sh
+
+      - name: Deploy Control Plane to Cloudflare Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          echo "📦 Deploying Control Plane to Cloudflare Pages..."
+          
+          # Get D1 database ID from Terraform output
+          cd tofu/control-plane
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          D1_DATABASE_ID=$(tofu output -raw d1_database_id)
+          echo "  D1 Database ID: $D1_DATABASE_ID"
+          cd ../..
+          
+          cd control-plane/pages
+          # Verify functions directory exists
+          if [ ! -d "functions" ]; then
+            echo "❌ Error: functions/ directory not found - API endpoints are required!"
+            exit 1
+          fi
+          
+          # Generate wrangler.toml with D1 binding
+          # pages_build_output_dir is required for Pages to use the config
+          PROJECT_NAME="${{ steps.prefix.outputs.project_name }}"
+          cat > wrangler.toml << EOF
+          name = "$PROJECT_NAME"
+          compatibility_date = "2024-01-01"
+          pages_build_output_dir = "."
+
+          [[d1_databases]]
+          binding = "NEXUS_DB"
+          database_id = "$D1_DATABASE_ID"
+          EOF
+          sed -i 's/^          //' wrangler.toml
+          
+          echo "  Generated wrangler.toml with D1 binding"
+          cat wrangler.toml
+          
+          # Deploy to production with D1 binding
+          # --commit-dirty=true suppresses warning about uncommitted wrangler.toml
+          # --commit-message prevents UTF-8 issues with git commit messages
+          npx wrangler@latest pages deploy . \
+            --project-name="$PROJECT_NAME" \
+            --branch=main \
+            --commit-dirty=true \
+            --commit-message="Deploy Control Plane"
+          
+          # Clean up generated wrangler.toml
+          rm wrangler.toml
+          
+          echo "✅ Control Plane deployed with D1 bindings!"
+
+      - name: Show setup info
+        run: |
+          echo ""
+          echo "✅ Control Plane setup complete!"
+          echo ""
+          echo "📋 Control Plane: https://control.${{ secrets.DOMAIN }}"
+          echo ""
+          echo "ℹ️  Next steps:"
+          echo "   1. Use the Control Plane to manage your infrastructure"
+          echo "   2. Run 'Spin Up' workflow to deploy the Hetzner server and services"
+          echo "   3. Or trigger it manually: Actions → Spin Up Nexus-Stack → Run workflow"
+
