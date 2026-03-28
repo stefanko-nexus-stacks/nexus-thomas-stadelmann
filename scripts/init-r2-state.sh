@@ -1,0 +1,345 @@
+#!/bin/bash
+# =============================================================================
+# Nexus-Stack - R2 State Backend Bootstrap
+# =============================================================================
+# Called by GitHub Actions setup-control-plane workflow.
+# Creates R2 bucket and API credentials for OpenTofu remote state.
+# This runs before 'tofu init' to solve the chicken-and-egg problem.
+#
+# Required environment variables:
+#   TF_VAR_cloudflare_api_token  - Cloudflare API token
+#   TF_VAR_cloudflare_account_id - Cloudflare Account ID
+#   TF_VAR_domain                - Domain name (used for bucket naming)
+# =============================================================================
+
+set -euo pipefail
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Generate bucket name from domain: nexus-stack.ch -> nexus-stack-ch-terraform-state
+DOMAIN="${TF_VAR_domain:-}"
+if [ -z "$DOMAIN" ]; then
+    echo -e "${RED}❌ TF_VAR_domain not set${NC}"
+    echo ""
+    echo "Set environment variables before running:"
+    echo "  export TF_VAR_domain=\"your-domain.com\""
+    echo ""
+    echo "Or source your .env file:"
+    echo "  source .env && make init"
+    exit 1
+fi
+
+DOMAIN_SLUG=$(echo "$DOMAIN" | tr '.' '-')
+BUCKET_NAME="${DOMAIN_SLUG}-terraform-state"
+
+R2_CREDENTIALS_FILE="tofu/.r2-credentials"
+
+echo -e "${BLUE}🪣 Nexus-Stack - R2 Bootstrap${NC}"
+echo "=============================="
+echo ""
+
+# Read from environment variables (TF_VAR_* format for OpenTofu compatibility)
+CLOUDFLARE_API_TOKEN="${TF_VAR_cloudflare_api_token:-}"
+CLOUDFLARE_ACCOUNT_ID="${TF_VAR_cloudflare_account_id:-}"
+
+# Validate required values
+if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+    echo -e "${RED}❌ TF_VAR_cloudflare_api_token not set${NC}"
+    echo ""
+    echo "Set environment variables before running:"
+    echo "  export TF_VAR_cloudflare_api_token=\"your-token\""
+    echo "  export TF_VAR_cloudflare_account_id=\"your-account-id\""
+    echo ""
+    echo "Or source your .env file:"
+    echo "  source .env && make init"
+    exit 1
+fi
+
+if [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+    echo -e "${RED}❌ TF_VAR_cloudflare_account_id not set${NC}"
+    echo ""
+    echo "Set environment variables before running:"
+    echo "  export TF_VAR_cloudflare_api_token=\"your-token\""
+    echo "  export TF_VAR_cloudflare_account_id=\"your-account-id\""
+    echo ""
+    echo "Or source your .env file:"
+    echo "  source .env && make init"
+    exit 1
+fi
+
+echo -e "📋 Account ID: ${YELLOW}${CLOUDFLARE_ACCOUNT_ID:0:8}...${NC}"
+
+# =============================================================================
+# Step 1: Check/Create R2 Bucket
+# =============================================================================
+echo ""
+echo -e "${BLUE}Step 1/3: Checking R2 bucket...${NC}"
+
+# Check if bucket exists
+BUCKET_CHECK=$(curl -s -w "\n%{http_code}" \
+    "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/r2/buckets/${BUCKET_NAME}" \
+    -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+
+HTTP_CODE=$(echo "$BUCKET_CHECK" | tail -n1)
+RESPONSE=$(echo "$BUCKET_CHECK" | sed '$d')
+
+if [ "$HTTP_CODE" = "200" ]; then
+    echo -e "  ${GREEN}✓${NC} Bucket '${BUCKET_NAME}' already exists"
+else
+    echo -e "  ${YELLOW}→${NC} Creating bucket '${BUCKET_NAME}'..."
+    
+    CREATE_RESPONSE=$(curl -s -X POST \
+        "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/r2/buckets" \
+        -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "{\"name\": \"${BUCKET_NAME}\"}")
+    
+    if echo "$CREATE_RESPONSE" | grep -q '"success":true'; then
+        echo -e "  ${GREEN}✓${NC} Bucket created successfully"
+    else
+        ERROR_MSG=$(echo "$CREATE_RESPONSE" | grep -o '"message":"[^"]*"' | head -1 | sed 's/"message":"//;s/"$//')
+        echo -e "  ${RED}❌ Failed to create bucket: ${ERROR_MSG}${NC}"
+        echo "     Check Cloudflare dashboard for details"
+        exit 1
+    fi
+fi
+
+# =============================================================================
+# Step 2: Check/Create R2 API Token
+# =============================================================================
+echo ""
+echo -e "${BLUE}Step 2/3: Checking R2 API credentials...${NC}"
+
+# Check if credentials file already exists with valid credentials
+if [ -f "$R2_CREDENTIALS_FILE" ]; then
+    source "$R2_CREDENTIALS_FILE"
+    if [ -n "$R2_ACCESS_KEY_ID" ] && [ -n "$R2_SECRET_ACCESS_KEY" ]; then
+        echo -e "  ${GREEN}✓${NC} R2 credentials already configured"
+        
+        # Export for current session
+        export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+        export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+        
+        # Generate backend.hcl with dynamic bucket name
+        echo ""
+        echo -e "${BLUE}Step 3/3: Generating backend configuration...${NC}"
+        cat > tofu/backend.hcl << EOF
+# Auto-generated by init-r2-state.sh
+# R2 endpoint and bucket configuration for OpenTofu S3 backend
+endpoints = {
+  s3 = "https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com"
+}
+bucket = "${BUCKET_NAME}"
+EOF
+        echo -e "  ${GREEN}✓${NC} Generated tofu/backend.hcl (bucket: ${BUCKET_NAME})"
+        
+        echo ""
+        echo -e "${GREEN}✅ R2 bootstrap complete!${NC}"
+        echo ""
+        echo "Credentials are stored in: $R2_CREDENTIALS_FILE"
+        echo "Bucket name: $BUCKET_NAME"
+        exit 0
+    fi
+fi
+
+echo -e "  ${YELLOW}→${NC} Creating R2 API token..."
+
+# Permission group ID for "Workers R2 Storage Write" (account-scoped)
+# This allows full read/write access to R2 buckets and objects
+# ID verified from Cloudflare docs: https://developers.cloudflare.com/r2/api/tokens/
+R2_STORAGE_WRITE_PERMISSION_ID="bf7481a1826f439697cb59a20b22293e"
+
+# Deterministic token name based on domain for multi-user safety
+# Allows targeted cleanup per deployment (e.g., education wrapper)
+TOKEN_NAME="nexus-r2-terraform-state-${DOMAIN_SLUG}"
+
+# Create User API token for R2 with account-level R2 permissions
+# Using account resource instead of bucket-specific resource for broader access
+# No expiration - token must remain valid for state access
+# Retry logic for temporary Cloudflare API errors (500, rate limits, etc.)
+
+# Helper function to extract error messages
+extract_error() {
+    echo "$1" | grep -o '"message":"[^"]*"' | head -1 | sed 's/"message":"//;s/"$//'
+}
+
+MAX_RETRIES=3
+RETRY=0
+TOKEN_RESPONSE=""
+
+while [ $RETRY -lt $MAX_RETRIES ]; do
+    TOKEN_RESPONSE=$(curl -s -X POST \
+        "https://api.cloudflare.com/client/v4/user/tokens" \
+        -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"name\": \"${TOKEN_NAME}\",
+            \"policies\": [
+                {
+                    \"effect\": \"allow\",
+                    \"resources\": {
+                        \"com.cloudflare.api.account.${CLOUDFLARE_ACCOUNT_ID}\": \"*\"
+                    },
+                    \"permission_groups\": [
+                        {
+                            \"id\": \"${R2_STORAGE_WRITE_PERMISSION_ID}\",
+                            \"name\": \"Workers R2 Storage Write\"
+                        }
+                    ]
+                }
+            ]
+        }")
+    
+    if echo "$TOKEN_RESPONSE" | grep -q '"success":true'; then
+        break
+    fi
+    
+    # Extract error message and code
+    ERROR_MSG=$(extract_error "$TOKEN_RESPONSE")
+    ERROR_CODE=$(echo "$TOKEN_RESPONSE" | grep -o '"code":[0-9]*' | head -1 | cut -d: -f2)
+    
+    # Token already exists — delete it and retry (credentials can't be retrieved after creation)
+    if echo "$TOKEN_RESPONSE" | grep -q "already exists"; then
+        RETRY=$((RETRY + 1))
+        echo -e "  ${YELLOW}⚠${NC}  Token '${TOKEN_NAME}' already exists — deleting and recreating..."
+
+        # Find the existing token by name (using jq for reliable JSON parsing)
+        EXISTING_TOKEN_ID=$(curl -s \
+            "https://api.cloudflare.com/client/v4/user/tokens" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            | jq -r --arg TOKEN_NAME "$TOKEN_NAME" \
+                '.result[] | select(.name == $TOKEN_NAME) | .id' | head -n 1)
+
+        if [ -n "$EXISTING_TOKEN_ID" ]; then
+            # Delete the existing token
+            DELETE_RESPONSE=$(curl -s -X DELETE \
+                "https://api.cloudflare.com/client/v4/user/tokens/${EXISTING_TOKEN_ID}" \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+
+            if echo "$DELETE_RESPONSE" | grep -q '"success":true'; then
+                echo -e "  ${GREEN}✓${NC} Old token deleted"
+                sleep 2
+                continue  # Retry token creation
+            else
+                echo -e "  ${RED}❌ Failed to delete existing token${NC}"
+                echo "     Delete it manually: Cloudflare Dashboard → My Profile → API Tokens"
+                exit 1
+            fi
+        else
+            echo -e "  ${RED}❌ Token exists but could not find its ID${NC}"
+            echo "     Delete it manually: Cloudflare Dashboard → My Profile → API Tokens"
+            exit 1
+        fi
+    fi
+    
+    # Retry on 500 errors or rate limits (retryable)
+    if [ "$ERROR_CODE" = "500" ] || [ "$ERROR_CODE" = "429" ] || [ -z "$ERROR_CODE" ]; then
+        RETRY=$((RETRY + 1))
+        if [ $RETRY -lt $MAX_RETRIES ]; then
+            WAIT_TIME=$((RETRY * 5))
+            echo -e "  ${YELLOW}⚠${NC}  API error (attempt $RETRY/$MAX_RETRIES): ${ERROR_MSG:-Unknown error}"
+            echo -e "  ${YELLOW}→${NC} Retrying in ${WAIT_TIME}s..."
+            sleep $WAIT_TIME
+            continue
+        fi
+    fi
+    
+    # Non-retryable error or max retries reached
+    ERROR_MSG=$(extract_error "$TOKEN_RESPONSE")
+    echo -e "  ${RED}❌ Failed to create token: ${ERROR_MSG:-Unknown error}${NC}"
+    echo "     Check Cloudflare dashboard for details"
+    exit 1
+done
+
+if ! echo "$TOKEN_RESPONSE" | grep -q '"success":true'; then
+    ERROR_MSG=$(extract_error "$TOKEN_RESPONSE")
+    echo -e "  ${RED}❌ Failed to create token after $MAX_RETRIES attempts: ${ERROR_MSG:-Unknown error}${NC}"
+    echo "     Check Cloudflare dashboard for details"
+    exit 1
+fi
+
+# Extract token ID and value
+TOKEN_ID=$(echo "$TOKEN_RESPONSE" | grep -o '"id":"[^"]*"' | head -1 | sed 's/"id":"//;s/"$//')
+TOKEN_VALUE=$(echo "$TOKEN_RESPONSE" | grep -o '"value":"[^"]*"' | sed 's/"value":"//;s/"$//')
+
+if [ -z "$TOKEN_ID" ] || [ -z "$TOKEN_VALUE" ]; then
+    echo -e "  ${RED}❌ Failed to extract token credentials${NC}"
+    echo "     Check Cloudflare dashboard for details"
+    exit 1
+fi
+
+# Calculate Secret Access Key (SHA-256 of token value)
+# Per Cloudflare docs: Access Key ID = token ID, Secret Access Key = SHA-256(token value)
+# See: https://developers.cloudflare.com/r2/api/tokens/#get-s3-api-credentials-from-an-api-token
+SECRET_KEY_SHA256=$(echo -n "$TOKEN_VALUE" | openssl dgst -sha256 | awk '{print $2}')
+
+if [ -z "$SECRET_KEY_SHA256" ]; then
+    echo -e "  ${YELLOW}⚠${NC}  SHA-256 derivation returned empty value"
+    echo -e "     You may need to use the raw token value instead."
+    echo -e "     See R2_SECRET_ACCESS_KEY_RAW in $R2_CREDENTIALS_FILE after setup."
+fi
+
+echo -e "  ${GREEN}✓${NC} R2 API token created"
+echo -e "  ${YELLOW}→${NC} Waiting for token propagation..."
+sleep 5
+
+# Save credentials to file
+# We save both the SHA-256 version and the raw token for debugging
+cat > "$R2_CREDENTIALS_FILE" << EOF
+# Nexus-Stack R2 Credentials
+# Auto-generated by init-r2-state.sh - DO NOT COMMIT
+# These credentials are used for OpenTofu remote state storage
+
+# Access Key ID = Token ID
+R2_ACCESS_KEY_ID="${TOKEN_ID}"
+
+# Secret Access Key = SHA-256 hash of token value (per Cloudflare docs)
+R2_SECRET_ACCESS_KEY="${SECRET_KEY_SHA256}"
+
+# Alternative: Raw token value (try this if SHA-256 doesn't work)
+# R2_SECRET_ACCESS_KEY_RAW="${TOKEN_VALUE}"
+
+# For S3-compatible tools, export these as:
+# export AWS_ACCESS_KEY_ID="\$R2_ACCESS_KEY_ID"
+# export AWS_SECRET_ACCESS_KEY="\$R2_SECRET_ACCESS_KEY"
+EOF
+
+chmod 600 "$R2_CREDENTIALS_FILE"
+echo -e "  ${GREEN}✓${NC} Saved credentials to $R2_CREDENTIALS_FILE"
+
+# =============================================================================
+# Step 3: Generate backend.hcl
+# =============================================================================
+echo ""
+echo -e "${BLUE}Step 3/3: Generating backend configuration...${NC}"
+
+cat > tofu/backend.hcl << EOF
+# Auto-generated by init-r2-state.sh
+# R2 endpoint and bucket configuration for OpenTofu S3 backend
+endpoints = {
+  s3 = "https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com"
+}
+bucket = "${BUCKET_NAME}"
+EOF
+
+echo -e "  ${GREEN}✓${NC} Generated tofu/backend.hcl (bucket: ${BUCKET_NAME})"
+
+# =============================================================================
+# Done
+# =============================================================================
+echo ""
+echo -e "${GREEN}✅ R2 bootstrap complete!${NC}"
+echo ""
+echo "Credentials saved to: $R2_CREDENTIALS_FILE"
+echo "Bucket name: $BUCKET_NAME"
+echo ""
+echo -e "${YELLOW}📝 To use with OpenTofu, run:${NC}"
+echo "   source $R2_CREDENTIALS_FILE"
+echo "   export AWS_ACCESS_KEY_ID=\"\$R2_ACCESS_KEY_ID\""
+echo "   export AWS_SECRET_ACCESS_KEY=\"\$R2_SECRET_ACCESS_KEY\""
+echo ""
