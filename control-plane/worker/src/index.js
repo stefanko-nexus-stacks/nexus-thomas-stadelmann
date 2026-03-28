@@ -332,7 +332,7 @@ async function sendNotification(env, config) {
         <p style="color:#fff">You can disable scheduled teardown via the Control Plane settings.</p>
         <h2 style="color:#00ff88;margin-top:2rem">🔗 Quick Links</h2>
         <ul>
-          <li><a href="https://control.${env.DOMAIN}" style="color:#00ff88">Control Plane</a> - Manage infrastructure</li>
+          <li><a href="https://control-thomas-stadelmann.nona.company" style="color:#00ff88">Control Plane</a> - Manage infrastructure</li>
           <li><a href="https://github.com/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/actions" style="color:#00ff88">GitHub Actions</a> - View workflows</li>
         </ul>
         <div style="margin-top:2rem;padding:1rem;background:#1a1a2e;border-left:3px solid #ffaa00">
@@ -344,7 +344,7 @@ async function sendNotification(env, config) {
     `;
 
     const emailPayload = {
-      from: `Nexus-Stack <nexus@${env.DOMAIN}>`,
+      from: `Nexus-Stack <nexus@${env.BASE_DOMAIN || env.DOMAIN}>`,
       to: userEmail ? [userEmail] : [env.ADMIN_EMAIL],
       subject: '⚠️ Scheduled Teardown in 15 Minutes',
       html: emailHtml,

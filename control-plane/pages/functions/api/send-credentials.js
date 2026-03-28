@@ -101,7 +101,7 @@ export async function onRequestPost(context) {
 
     // Send email via Resend (User as primary, Admin in CC)
     const emailPayload = {
-      from: `Nexus-Stack <nexus@${domain}>`,
+      from: `Nexus-Stack <nexus@${env.BASE_DOMAIN || domain}>`,
       to: userEmail ? [userEmail] : [adminEmail],
       subject: '🔐 Nexus-Stack Credentials',
       html: emailHTML

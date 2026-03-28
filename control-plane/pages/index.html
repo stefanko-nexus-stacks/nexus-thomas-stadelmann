@@ -1072,7 +1072,7 @@
                     const domain = info.server?.domain || window.location.hostname.replace('control.', '');
                     const infoLink = document.getElementById('info-link');
                     if (infoLink && domain) {
-                        infoLink.href = `https://info.${domain}`;
+                        infoLink.href = 'https://info-thomas-stadelmann.nona.company';
                     }
                     
                     // Update workflow timestamps (from D1 via server object)
@@ -1843,7 +1843,7 @@
         if (infoLink && (!infoLink.href || infoLink.href === '#')) {
             const hostname = window.location.hostname;
             if (hostname.startsWith('control.')) {
-                infoLink.href = `https://info.${hostname.replace('control.', '')}`;
+                infoLink.href = 'https://info-thomas-stadelmann.nona.company';
             } else {
                 // Fallback: extract domain by removing leftmost subdomain label
                 // Handles multi-part TLDs (e.g., example.co.uk) correctly
@@ -1852,11 +1852,11 @@
                     // Remove leftmost label (subdomain) to get domain
                     const domain = parts.slice(1).join('.');
                     if (domain && domain !== hostname) {
-                        infoLink.href = `https://info.${domain}`;
+                        infoLink.href = 'https://info-thomas-stadelmann.nona.company';
                     }
                 } else if (parts.length === 2) {
                     // Already a domain (no subdomain)
-                    infoLink.href = `https://info.${hostname}`;
+                    infoLink.href = 'https://info-thomas-stadelmann.nona.company';
                 }
             }
         }

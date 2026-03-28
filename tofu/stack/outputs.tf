@@ -30,14 +30,14 @@ output "ssh_firewall_id" {
 
 output "ssh_command" {
   description = "SSH command via Cloudflare Tunnel (requires cloudflared locally)"
-  value       = "cloudflared access ssh --hostname ssh.${var.domain}"
+  value       = "cloudflared access ssh --hostname ssh-thomas-stadelmann.nona.company"
 }
 
 output "ssh_config" {
   description = "Add this to ~/.ssh/config for easy access"
   value       = <<-EOT
     Host nexus
-      HostName ssh.${var.domain}
+      HostName ssh-thomas-stadelmann.nona.company
       User root
       ProxyCommand cloudflared access ssh --hostname %h
   EOT
@@ -69,7 +69,7 @@ output "service_urls" {
   description = "URLs for all enabled services with a subdomain"
   value = {
     for key, service in local.enabled_services_with_subdomain :
-    key => "https://${service.subdomain}.${var.domain}"
+    key => "https://${service.subdomain}-thomas-stadelmann.nona.company"
   }
 }
 

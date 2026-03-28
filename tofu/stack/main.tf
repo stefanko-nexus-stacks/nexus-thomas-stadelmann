@@ -534,7 +534,7 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "main" {
   config {
     # SSH access
     ingress_rule {
-      hostname = "ssh.${var.domain}"
+      hostname = "ssh-thomas-stadelmann.nona.company"
       service  = "ssh://localhost:22"
     }
 
@@ -542,7 +542,7 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "main" {
     dynamic "ingress_rule" {
       for_each = local.enabled_services_with_subdomain
       content {
-        hostname = "${ingress_rule.value.subdomain}.${var.domain}"
+        hostname = "${ingress_rule.value.subdomain}-thomas-stadelmann.nona.company"
         service  = "http://localhost:${ingress_rule.value.port}"
       }
     }
@@ -560,7 +560,7 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "main" {
 
 resource "cloudflare_record" "ssh" {
   zone_id = var.cloudflare_zone_id
-  name    = "ssh"
+  name    = "ssh-thomas-stadelmann"
   content = "${cloudflare_zero_trust_tunnel_cloudflared.main.id}.cfargotunnel.com"
   type    = "CNAME"
   proxied = true
@@ -572,7 +572,7 @@ resource "cloudflare_record" "services" {
   for_each = local.enabled_services_with_subdomain
 
   zone_id = var.cloudflare_zone_id
-  name    = each.value.subdomain
+  name    = "${each.value.subdomain}-thomas-stadelmann"
   content = "${cloudflare_zero_trust_tunnel_cloudflared.main.id}.cfargotunnel.com"
   type    = "CNAME"
   proxied = true
@@ -596,7 +596,7 @@ resource "cloudflare_record" "firewall_tcp" {
   for_each = local.firewall_dns_records
 
   zone_id = var.cloudflare_zone_id
-  name    = each.value.dns_record
+  name    = "${each.value.dns_record}-thomas-stadelmann"
   content = hcloud_server.main.ipv4_address
   type    = "A"
   proxied = false
@@ -611,7 +611,7 @@ resource "cloudflare_record" "firewall_tcp" {
 resource "cloudflare_zero_trust_access_application" "ssh" {
   zone_id          = var.cloudflare_zone_id
   name             = "${local.resource_prefix} SSH"
-  domain           = "ssh.${var.domain}"
+  domain           = "ssh-thomas-stadelmann.nona.company"
   type             = "ssh"
   session_duration = "1h"
 }
@@ -661,7 +661,7 @@ resource "cloudflare_zero_trust_access_application" "services" {
 
   zone_id           = var.cloudflare_zone_id
   name              = "${local.resource_prefix} ${title(each.key)}"
-  domain            = "${each.value.subdomain}.${var.domain}"
+  domain            = "${each.value.subdomain}-thomas-stadelmann.nona.company"
   type              = "self_hosted"
   # Wetty uses shorter session duration (1h) for enhanced security
   # Other services use 24h for better user experience

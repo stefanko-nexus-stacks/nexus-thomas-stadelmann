@@ -416,7 +416,7 @@
         function createServiceCard(name, service, isActive) {
             // Check if service has a subdomain (internal-only services don't)
             const hasSubdomain = service.subdomain && service.subdomain !== '';
-            const url = hasSubdomain ? `https://${service.subdomain}.${DOMAIN}` : 'Internal-only';
+            const url = hasSubdomain ? `https://${service.subdomain}-thomas-stadelmann.nona.company` : 'Internal-only';
             const description = service.description || 'No description available';
             const version = getVersion(name);
             const card = document.createElement('div');
